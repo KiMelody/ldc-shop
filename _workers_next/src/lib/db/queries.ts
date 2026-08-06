@@ -46,14 +46,48 @@ async function ensureCardKeyDuplicatesAllowed() {
     }
 }
 
+async function extractSqliteMessage(err: any): Promise<string> {
+    if (!err) return '';
+    const parts: string[] = [];
+    if (typeof err.message === 'string') parts.push(err.message);
+    if (err.cause && typeof err.cause.message === 'string') parts.push(err.cause.message);
+    if (err.cause && err.cause.cause && typeof err.cause.cause.message === 'string') {
+        parts.push(err.cause.cause.message);
+    }
+    try {
+        const json = JSON.stringify(err);
+        if (json && json !== '{}') parts.push(json);
+    } catch {
+        /* ignore */
+    }
+    try {
+        parts.push(String(err));
+    } catch {
+        /* ignore */
+    }
+    try {
+        if (typeof err.toString === 'function') {
+            const s = err.toString();
+            if (s && s !== '[object Object]') parts.push(s);
+        }
+    } catch {
+        /* ignore */
+    }
+    return parts.join(' | ');
+}
+
 async function safeAddColumn(table: string, column: string, definition: string) {
     try {
         await db.run(sql.raw(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`));
     } catch (e: any) {
-        // Ignore "duplicate column" errors in SQLite
-        // Use JSON.stringify AND String(e) to be safe across different environments
-        const errorString = (JSON.stringify(e) + String(e)).toLowerCase();
-        if (!errorString.includes('duplicate column')) throw e;
+        // D1 in Workers throws errors where .message is sometimes a non-enumerable
+        // own property — JSON.stringify(e) returns "{}" and String(e) returns
+        // "[object Object]" in those cases. extractSqliteMessage walks .message,
+        // .cause.message, JSON, String() and toString() to be robust.
+        const errorMessage = (await extractSqliteMessage(e)).toLowerCase();
+        // D1 returns: "duplicate column name: reserved_order_id: SQLITE_ERROR"
+        // SQLite (via better-sqlite3) returns: "duplicate column name: reserved_order_id"
+        if (!errorMessage.includes('duplicate column')) throw e;
     }
 }
 
@@ -437,46 +471,95 @@ async function ensureDatabaseInitialized() {
 
 async function ensureProductsColumns() {
     await ensureColumnsOnce('products', async () => {
-        await safeAddColumn('products', 'compare_at_price', 'TEXT');
-        await safeAddColumn('products', 'max_points_discount', 'TEXT');
-        await safeAddColumn('products', 'is_hot', 'INTEGER DEFAULT 0');
-        await safeAddColumn('products', 'purchase_warning', 'TEXT');
-        await safeAddColumn('products', 'is_shared', 'INTEGER DEFAULT 0');
-        await safeAddColumn('products', 'visibility_level', 'INTEGER DEFAULT -1');
-        await safeAddColumn('products', 'stock_count', 'INTEGER DEFAULT 0');
-        await safeAddColumn('products', 'locked_count', 'INTEGER DEFAULT 0');
-        await safeAddColumn('products', 'sold_count', 'INTEGER DEFAULT 0');
-        await safeAddColumn('products', 'rating', 'REAL DEFAULT 0');
-        await safeAddColumn('products', 'review_count', 'INTEGER DEFAULT 0');
-        await safeAddColumn('products', 'variant_group_id', 'TEXT');
-        await safeAddColumn('products', 'variant_label', 'TEXT');
-        await safeAddColumn('products', 'purchase_questions', 'TEXT');
-        await safeAddColumn('products', 'product_images', 'TEXT');
+        const existing = await getExistingColumns('products');
+        if (existing.size === 0) return;
+        const wanted: Array<[string, string]> = [
+            ['compare_at_price', 'TEXT'],
+            ['max_points_discount', 'TEXT'],
+            ['is_hot', 'INTEGER DEFAULT 0'],
+            ['purchase_warning', 'TEXT'],
+            ['is_shared', 'INTEGER DEFAULT 0'],
+            ['visibility_level', 'INTEGER DEFAULT -1'],
+            ['stock_count', 'INTEGER DEFAULT 0'],
+            ['locked_count', 'INTEGER DEFAULT 0'],
+            ['sold_count', 'INTEGER DEFAULT 0'],
+            ['rating', 'REAL DEFAULT 0'],
+            ['review_count', 'INTEGER DEFAULT 0'],
+            ['variant_group_id', 'TEXT'],
+            ['variant_label', 'TEXT'],
+            ['purchase_questions', 'TEXT'],
+            ['product_images', 'TEXT'],
+        ];
+        for (const [col, def] of wanted) {
+            if (!existing.has(col)) {
+                await db.run(sql.raw(`ALTER TABLE products ADD COLUMN ${col} ${def}`));
+            }
+        }
     });
 }
 
 async function ensureOrdersColumns() {
     await ensureColumnsOnce('orders', async () => {
-        await safeAddColumn('orders', 'points_used', 'INTEGER DEFAULT 0 NOT NULL');
-        await safeAddColumn('orders', 'current_payment_id', 'TEXT');
-        await safeAddColumn('orders', 'payee', 'TEXT');
-        await safeAddColumn('orders', 'card_ids', 'TEXT');
+        const existing = await getExistingColumns('orders');
+        if (existing.size === 0) return;
+        const wanted: Array<[string, string]> = [
+            ['points_used', 'INTEGER DEFAULT 0 NOT NULL'],
+            ['current_payment_id', 'TEXT'],
+            ['payee', 'TEXT'],
+            ['card_ids', 'TEXT'],
+        ];
+        for (const [col, def] of wanted) {
+            if (!existing.has(col)) {
+                await db.run(sql.raw(`ALTER TABLE orders ADD COLUMN ${col} ${def}`));
+            }
+        }
     });
+}
+
+async function getExistingColumns(table: string): Promise<Set<string>> {
+    try {
+        // PRAGMA table_info returns: cid, name, type, notnull, dflt_value, pk
+        const result: any = await db.all(sql.raw(`PRAGMA table_info(${table})`));
+        const rows: Array<{ name: string }> = result?.results ?? result ?? [];
+        return new Set(rows.map((r) => r?.name).filter(Boolean));
+    } catch {
+        // If the table doesn't exist yet (first init), behave like "no columns known"
+        // so the surrounding CREATE TABLE IF NOT EXISTS logic owns the schema.
+        return new Set();
+    }
 }
 
 async function ensureCardsColumns() {
     await ensureColumnsOnce('cards', async () => {
-        await safeAddColumn('cards', 'reserved_order_id', 'TEXT');
-        await safeAddColumn('cards', 'reserved_at', 'INTEGER');
-        await safeAddColumn('cards', 'expires_at', 'INTEGER');
+        const existing = await getExistingColumns('cards');
+        if (existing.size === 0) return;
+        const wanted: Array<[string, string]> = [
+            ['reserved_order_id', 'TEXT'],
+            ['reserved_at', 'INTEGER'],
+            ['expires_at', 'INTEGER'],
+        ];
+        for (const [col, def] of wanted) {
+            if (!existing.has(col)) {
+                await db.run(sql.raw(`ALTER TABLE cards ADD COLUMN ${col} ${def}`));
+            }
+        }
     });
 }
 
 async function ensureLoginUsersColumns() {
     await ensureColumnsOnce('loginUsers', async () => {
-        await safeAddColumn('login_users', 'last_checkin_at', 'INTEGER');
-        await safeAddColumn('login_users', 'consecutive_days', 'INTEGER DEFAULT 0');
-        await safeAddColumn('login_users', 'desktop_notifications_enabled', 'INTEGER DEFAULT 0');
+        const existing = await getExistingColumns('login_users');
+        if (existing.size === 0) return;
+        const wanted: Array<[string, string]> = [
+            ['last_checkin_at', 'INTEGER'],
+            ['consecutive_days', 'INTEGER DEFAULT 0'],
+            ['desktop_notifications_enabled', 'INTEGER DEFAULT 0'],
+        ];
+        for (const [col, def] of wanted) {
+            if (!existing.has(col)) {
+                await db.run(sql.raw(`ALTER TABLE login_users ADD COLUMN ${col} ${def}`));
+            }
+        }
     });
 }
 
@@ -484,10 +567,21 @@ export async function ensureLoginUsersSchema() {
     if (loginUsersSchemaReady) return;
     await ensureLoginUsersTable();
     await ensureLoginUsersColumns();
-    await safeAddColumn('login_users', 'email', 'TEXT');
-    await safeAddColumn('login_users', 'points', 'INTEGER DEFAULT 0 NOT NULL');
-    await safeAddColumn('login_users', 'is_blocked', 'INTEGER DEFAULT 0');
-    await safeAddColumn('login_users', 'desktop_notifications_enabled', 'INTEGER DEFAULT 0');
+
+    const existing = await getExistingColumns('login_users');
+    if (existing.size > 0) {
+        const wanted: Array<[string, string]> = [
+            ['email', 'TEXT'],
+            ['points', 'INTEGER DEFAULT 0 NOT NULL'],
+            ['is_blocked', 'INTEGER DEFAULT 0'],
+            ['desktop_notifications_enabled', 'INTEGER DEFAULT 0'],
+        ];
+        for (const [col, def] of wanted) {
+            if (!existing.has(col)) {
+                await db.run(sql.raw(`ALTER TABLE login_users ADD COLUMN ${col} ${def}`));
+            }
+        }
+    }
     loginUsersSchemaReady = true;
 }
 
@@ -1906,11 +2000,25 @@ async function ensureWishlistTables() {
 }
 
 async function ensureWishlistColumns() {
-    await safeAddColumn('wishlist_items', 'description', 'TEXT');
-    await safeAddColumn('wishlist_items', 'user_id', 'TEXT');
-    await safeAddColumn('wishlist_items', 'username', 'TEXT');
-    await safeAddColumn('wishlist_items', 'created_at', 'INTEGER');
-    await safeAddColumn('wishlist_votes', 'created_at', 'INTEGER');
+    const itemCols = await getExistingColumns('wishlist_items');
+    if (itemCols.size > 0) {
+        const wanted: Array<[string, string]> = [
+            ['description', 'TEXT'],
+            ['user_id', 'TEXT'],
+            ['username', 'TEXT'],
+            ['created_at', 'INTEGER'],
+        ];
+        for (const [col, def] of wanted) {
+            if (!itemCols.has(col)) {
+                await db.run(sql.raw(`ALTER TABLE wishlist_items ADD COLUMN ${col} ${def}`));
+            }
+        }
+    }
+
+    const voteCols = await getExistingColumns('wishlist_votes');
+    if (voteCols.size > 0 && !voteCols.has('created_at')) {
+        await db.run(sql.raw(`ALTER TABLE wishlist_votes ADD COLUMN created_at INTEGER`));
+    }
 }
 
 type GitHubLoginUserRow = {
@@ -2396,7 +2504,10 @@ export async function updateLoginUserEmail(userId: string, email: string | null)
     if (!userId) return;
     try {
         await ensureLoginUsersTable();
-        await safeAddColumn('login_users', 'email', 'TEXT');
+        const existing = await getExistingColumns('login_users');
+        if (existing.size > 0 && !existing.has('email')) {
+            await db.run(sql.raw(`ALTER TABLE login_users ADD COLUMN email TEXT`));
+        }
         await db.update(loginUsers)
             .set({ email: email || null, lastLoginAt: new Date() })
             .where(eq(loginUsers.userId, userId));
